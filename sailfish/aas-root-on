@@ -1,0 +1,63 @@
+#!/bin/sh
+set -eu
+
+UNIT=aas-sud-test.service
+
+echo "=== AAS Root einschalten ==="
+
+# Overlay innerhalb von Android einbinden
+/usr/sbin/appsupport-attach /system/bin/sh -c '
+    set -eu
+
+    BIN=/data/local/tmp/sud-allowlist
+    EXTRA=/data/local/tmp/aas-su-allow-test/extra
+
+    # Dateien prüfen
+    if [ ! -x "$BIN" ] || [ ! -x "$EXTRA/su" ]; then
+        echo "FEHLER: sud-Binary fehlt!"
+        exit 1
+    fi
+
+    # Overlay nur bei Bedarf einbinden
+    if grep -q " /system/bin " /proc/self/mountinfo; then
+        if ! grep " /system/bin " /proc/self/mountinfo |
+             grep -Fq "lowerdir=$EXTRA:/system/bin"; then
+            echo "FEHLER: Unbekannter Mount auf /system/bin!"
+            exit 1
+        fi
+        echo "Overlay bereits aktiv"
+    else
+        mount -t overlay overlay \
+            -o "lowerdir=$EXTRA:/system/bin" \
+            /system/bin
+        echo "Overlay eingebunden"
+    fi
+
+    # su kontrollieren
+    if [ ! -x /system/bin/su ]; then
+        echo "FEHLER: su nicht verfügbar!"
+        exit 1
+    fi
+'
+
+# Root-Daemon über systemd starten
+if systemctl is-active --quiet "$UNIT"; then
+    echo "Daemon bereits aktiv"
+else
+    systemd-run --system \
+        --unit=aas-sud-test \
+        --collect \
+        /usr/sbin/appsupport-attach \
+        /data/local/tmp/sud-allowlist --daemon
+fi
+
+# Daemon kontrollieren
+sleep 1
+
+if ! /usr/sbin/appsupport-attach /system/bin/pidof \
+    sud-allowlist >/dev/null; then
+    echo "FEHLER: Daemon läuft nicht!"
+    exit 1
+fi
+
+echo "Root AN"
