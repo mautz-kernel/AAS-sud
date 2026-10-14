@@ -158,6 +158,54 @@ static int from_init(struct su_initiator *from) {
     return 0;
 }
 
+#define ALLOWLIST "/data/aas-sud-allow.uids"
+
+static int uid_allowed(unsigned int uid) {
+    int fd = open(ALLOWLIST, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & 0777) != 0600) {
+        close(fd);
+        return 0;
+    }
+
+    FILE *file = fdopen(fd, "r");
+    if (!file) {
+        close(fd);
+        return 0;
+    }
+
+char line[32];
+int allowed = 0;
+
+while (fgets(line, sizeof(line), file)) {
+    char *end;
+    errno = 0;
+
+    unsigned long entry = strtoul(line, &end, 10);
+
+    if (line[0] < '0' || line[0] > '9' ||
+        errno || entry > UINT_MAX ||
+        (*end != '\n' && *end != '\0') ||
+        (*end == '\0' && !feof(file))) {
+        allowed = 0;
+        break;
+    }
+
+    if (entry == uid)
+        allowed = 1;
+}
+
+if (ferror(file))
+     allowed = 0;
+
+    fclose(file);
+    return allowed;
+}
+
 static void user_init(struct su_context *ctx) {
     if (ctx->from.uid > 99999) {
         ctx->user.android_user_id = ctx->from.uid / 100000;
@@ -627,8 +675,12 @@ int su_main(int argc, char *argv[], int need_client) {
 
     user_init(&ctx);
 
-    // Allow everything
-    allow(&ctx);
+    // Allow only UIDs listed in the configuration
+    if (uid_allowed(ctx.from.uid)) {
+        allow(&ctx);
+    } else {
+        fail(&ctx);
+    }
 
     // odd perms on superuser data dir
     if (st.st_gid != st.st_uid) {
