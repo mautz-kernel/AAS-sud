@@ -627,8 +627,8 @@ int su_main(int argc, char *argv[], int need_client) {
 
     user_init(&ctx);
 
-    // Allow everything
-    allow(&ctx);
+    // Deny all root requests by default
+    fail(&ctx);
 
     // odd perms on superuser data dir
     if (st.st_gid != st.st_uid) {
