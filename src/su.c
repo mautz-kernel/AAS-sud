@@ -675,8 +675,12 @@ int su_main(int argc, char *argv[], int need_client) {
 
     user_init(&ctx);
 
-    // Deny all root requests by default
-    fail(&ctx);
+    // Allow only UIDs listed in the configuration
+    if (uid_allowed(ctx.from.uid)) {
+        allow(&ctx);
+    } else {
+        fail(&ctx);
+    }
 
     // odd perms on superuser data dir
     if (st.st_gid != st.st_uid) {
