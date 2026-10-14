@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+echo "=== AAS Root ausschalten ==="
+
+# Daemon über systemd stoppen
+if systemctl is-active --quiet aas-sud-test.service; then
+    systemctl stop aas-sud-test.service
+fi
+
+/usr/sbin/appsupport-attach /system/bin/sh -c '
+    set -eu
+
+    # Sicherstellen, dass sud beendet ist
+    if pidof sud-allowlist >/dev/null 2>&1; then
+        echo "FEHLER: sud läuft noch!"
+        exit 1
+    fi
+
+    # Overlay entfernen, falls vorhanden
+    if grep -q " /system/bin .* - overlay " /proc/self/mountinfo; then
+        umount -l /system/bin
+    fi
+
+    # Ergebnis prüfen
+    if [ -e /system/bin/su ]; then
+        echo "FEHLER: su ist noch vorhanden!"
+        exit 1
+    fi
+
+    echo "Root AUS"
+'
