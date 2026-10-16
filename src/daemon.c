@@ -261,6 +261,19 @@ static int daemon_accept(int fd) {
         daemon_from_pid = credentials.pid;
     }
 
+    // Reject unauthorized UIDs before processing client FDs.
+    int authorized = uid_allowed(daemon_from_uid);
+
+    write_int(fd, authorized);
+
+    if (!authorized) {
+        LOGW("sud: rejected uid %d before FD handling",
+             daemon_from_uid);
+        free(pts_slave);
+        close(fd);
+        return -1;
+    }
+
     // The the FDs for each of the streams
     int infd  = recv_fd(fd);
     int outfd = recv_fd(fd);
@@ -549,6 +562,15 @@ int connect_daemon(int argc, char *argv[], int ppid) {
     write_int(socketfd, uid);
     // Parent PID
     write_int(socketfd, ppid);
+
+    // Wait for early UID authorization before sending FDs.
+    int authorized = read_int(socketfd);
+
+    if (!authorized) {
+        fprintf(stderr, "%s\n", strerror(EACCES));
+        close(socketfd);
+        return EXIT_FAILURE;
+    }
 
     // Send stdin
     if (atty & ATTY_IN) {
