@@ -141,6 +141,7 @@ static inline char *get_command(const struct su_request *to)
 int run_daemon();
 int connect_daemon(int argc, char *argv[], int ppid);
 int su_main(int argc, char *argv[], int need_client);
+int uid_allowed(unsigned int uid);
 // for when you give zero fucks about the state of the child process.
 // this version of fork understands you don't care about the child.
 // deadbeat dad fork.

@@ -160,7 +160,7 @@ static int from_init(struct su_initiator *from) {
 
 #define ALLOWLIST "/data/aas-sud-allow.uids"
 
-static int uid_allowed(unsigned int uid) {
+int uid_allowed(unsigned int uid) {
     int fd = open(ALLOWLIST, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0)
         return 0;
