@@ -675,6 +675,8 @@ int su_main(int argc, char *argv[], int need_client) {
 
     user_init(&ctx);
 
+    ctx.umask = 027;
+
     // Allow only UIDs listed in the configuration
     if (uid_allowed(ctx.from.uid)) {
         allow(&ctx);
@@ -688,8 +690,6 @@ int su_main(int argc, char *argv[], int need_client) {
                 (int)st.st_uid, (int)st.st_gid);
         fail(&ctx);
     }
-
-    ctx.umask = umask(027);
 
     mkdir(REQUESTOR_CACHE_PATH, 0770);
     if (chown(REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid)) {
