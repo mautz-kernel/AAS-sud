@@ -45,22 +45,37 @@ The original Android system partition is not modified.
 - Stops the daemon through systemd.
 - Removes the OverlayFS mount.
 - Verifies that `/system/bin/su` is no longer available.
+- Removes the obsolete `/dev/com.koushikdutta.superuser.daemon` directory and verifies its removal.
 
 Both scripts have been tested without restarting Android AppSupport.
 
-## Current file locations
+## Current file locations and permissions
 
-The current prototype expects the following paths inside Android AppSupport:
+The tested setup uses the following paths **inside Android AppSupport**:
 
-| File | Path |
-|---|---|
-| Modified sud binary | `/data/local/tmp/sud-allowlist` |
-| OverlayFS su executable | `/data/local/tmp/aas-su-allow-test/extra/su` |
-| UID allowlist | `/data/aas-sud-allow.uids` |
+| File or directory | Path | Owner | Mode |
+|---|---|---|---|
+| Protected directory | `/data/local/aas-sud/` | `root:root` | `0700` |
+| Modified sud binary | `/data/local/aas-sud/sud-allowlist` | `root:root` | `0755` |
+| OverlayFS lower directory | `/data/local/aas-sud/extra/` | `root:root` | `0755` |
+| OverlayFS su executable | `/data/local/aas-sud/extra/su` | `root:root` | `0755` |
+| UID allowlist | `/data/aas-sud-allow.uids` | `root:root` | `0600` |
 
-The scripts use the transient Sailfish systemd unit `aas-sud-test.service`.
+After placing the binaries and allowlist in their locations, set and verify ownership and permissions as root **inside AAS, with the root overlay inactive**:
 
-These names and paths currently reflect the tested prototype. They may change in later versions.
+```sh
+chown root:root /data/local/aas-sud /data/local/aas-sud/extra \
+  /data/local/aas-sud/sud-allowlist /data/local/aas-sud/extra/su
+chmod 700 /data/local/aas-sud
+chmod 755 /data/local/aas-sud/extra \
+  /data/local/aas-sud/sud-allowlist /data/local/aas-sud/extra/su
+chown root:root /data/aas-sud-allow.uids
+chmod 600 /data/aas-sud-allow.uids
+```
+
+**Important OverlayFS detail:** Although the parent `aas-sud/` directory must remain mode `0700`, its `extra/` directory must be mode `0755`. The mount presents that directory at `/system/bin`; if `extra/` is mode `0700`, ordinary Android UIDs can lose access even to `/system/bin/sh`. Mode `0755` permits execution and traversal without permitting non-root writes; the protected parent remains inaccessible to UID 2000.
+
+The scripts use the transient Sailfish systemd unit `aas-sud-test.service`. These names are still prototype-specific and may change in later versions.
 
 ## Usage
 
@@ -101,7 +116,7 @@ This is an experimental implementation, not a security-audited root solution.
 - Apps sharing a UID also share the corresponding root permission.
 - Disabling root does not automatically terminate processes that already have root privileges.
 - Android AppSupport restarts remove the temporary OverlayFS mount and stop the running daemon. Root must be enabled again afterward.
-- The scripts currently rely on manually prepared files and prototype-specific paths.
+- The scripts currently rely on manually prepared, root-owned files and prototype-specific paths.
 - Reuse of an Android UID after app removal must be considered when managing allowlist entries.
 
 The modified daemon and its surrounding setup require further security review before being recommended for general use.
