@@ -240,46 +240,27 @@ static int run_daemon_child(int infd, int outfd, int errfd, int argc, char** arg
     return su_main(argc, argv, 0);
 }
 
-static int daemon_accept(int fd) {
+static int daemon_accept(int fd, uid_t peer_uid, pid_t peer_pid) {
     is_daemon = 1;
-    int pid = read_int(fd);
-    LOGD("remote pid: %d", pid);
+
+    // The listener already verified the kernel-provided peer credentials.
+    // Never use the client-supplied UID or PID for authorization.
+    daemon_from_uid = peer_uid;
+    daemon_from_pid = peer_pid;
+
+    // Authorize before reading even the first client-controlled field.
+    write_int(fd, 1);
+
+    int reported_pid = read_int(fd);
+    LOGD("reported client pid: %d", reported_pid);
     char *pts_slave = read_string(fd);
     LOGD("remote pts_slave: %s", pts_slave);
-    daemon_from_uid = read_int(fd);
-    LOGD("remote uid: %d", daemon_from_uid);
-    daemon_from_pid = read_int(fd);
-    LOGD("remote req pid: %d", daemon_from_pid);
+    int reported_uid = read_int(fd);
+    int reported_request_pid = read_int(fd);
+    LOGD("reported uid: %d, request pid: %d",
+         reported_uid, reported_request_pid);
 
-    struct ucred credentials;
-    int ucred_length = sizeof(struct ucred);
-    /* fill in the user data structure */
-    if(getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, (unsigned int *)&ucred_length)) {
-        LOGE("could obtain credentials from unix domain socket");
-        exit(-1);
-    }
-    // if the credentials on the other side of the wire are NOT root,
-    // we can't trust anything being sent.
-    if (credentials.uid != 0) {
-        daemon_from_uid = credentials.uid;
-        pid = credentials.pid;
-        daemon_from_pid = credentials.pid;
-    }
-
-    // Reject unauthorized UIDs before processing client FDs.
-    int authorized = uid_allowed(daemon_from_uid);
-
-    write_int(fd, authorized);
-
-    if (!authorized) {
-        LOGW("sud: rejected uid %d before FD handling",
-             daemon_from_uid);
-        free(pts_slave);
-        close(fd);
-        return -1;
-    }
-
-    // The the FDs for each of the streams
+    // The FDs for each of the streams
     int infd  = recv_fd(fd);
     int outfd = recv_fd(fd);
     int errfd = recv_fd(fd);
@@ -414,15 +395,41 @@ int run_daemon() {
         goto err;
     }
 
-    int client;
-    while ((client = accept(fd, NULL, NULL)) > 0) {
+    for (;;) {
+        int client = accept(fd, NULL, NULL);
+        if (client < 0) {
+            if (errno == EINTR)
+                continue;
+            PLOGE("accept");
+            break;
+        }
+
+        // Check kernel credentials BEFORE forking or reading client data.
+        struct ucred credentials;
+        socklen_t credentials_len = sizeof(credentials);
+        if (getsockopt(client, SOL_SOCKET, SO_PEERCRED,
+                       &credentials, &credentials_len) != 0 ||
+            credentials_len != sizeof(credentials)) {
+            LOGE("unable to obtain complete SO_PEERCRED credentials");
+            close(client);
+            continue;
+        }
+
+        if (!uid_allowed(credentials.uid)) {
+            // Avoid blocking the main listener on an untrusted peer.
+            const int denied = 0;
+            LOGW("sud: rejected uid %u before fork", (unsigned)credentials.uid);
+            (void)send(client, &denied, sizeof(denied),
+                       MSG_DONTWAIT | MSG_NOSIGNAL);
+            close(client);
+            continue;
+        }
+
         if (fork_zero_fucks() == 0) {
             close(fd);
-            return daemon_accept(client);
+            return daemon_accept(client, credentials.uid, credentials.pid);
         }
-        else {
-            close(client);
-        }
+        close(client);
     }
 
     LOGE("daemon exiting");
@@ -512,6 +519,14 @@ int connect_daemon(int argc, char *argv[], int ppid) {
         exit(-1);
     }
 
+    // Wait for the listener's authorization before sending any client data.
+    int authorized = read_int(socketfd);
+    if (!authorized) {
+        fprintf(stderr, "%s\n", strerror(EACCES));
+        close(socketfd);
+        return EXIT_FAILURE;
+    }
+
     LOGD("connecting client %d", getpid());
 
     // Determine which one of our streams are attached to a TTY
@@ -545,15 +560,6 @@ int connect_daemon(int argc, char *argv[], int ppid) {
     write_int(socketfd, uid);
     // Parent PID
     write_int(socketfd, ppid);
-
-    // Wait for early UID authorization before sending FDs.
-    int authorized = read_int(socketfd);
-
-    if (!authorized) {
-        fprintf(stderr, "%s\n", strerror(EACCES));
-        close(socketfd);
-        return EXIT_FAILURE;
-    }
 
     // Send stdin
     if (atty & ATTY_IN) {
