@@ -251,157 +251,6 @@ void set_identity(unsigned int uid) {
     }
 }
 
-static void socket_cleanup(struct su_context *ctx) {
-    if (ctx && ctx->sock_path[0]) {
-        if (unlink(ctx->sock_path))
-            PLOGE("unlink (%s)", ctx->sock_path);
-        ctx->sock_path[0] = 0;
-    }
-}
-
-/*
- * For use in signal handlers/atexit-function
- * NOTE: su_ctx points to main's local variable.
- *       It's OK due to the program uses exit(3), not return from main()
- */
-static struct su_context *su_ctx = NULL;
-
-static void cleanup(void) {
-    socket_cleanup(su_ctx);
-}
-
-static void cleanup_signal(int sig) {
-    socket_cleanup(su_ctx);
-    exit(128 + sig);
-}
-
-static int socket_create_temp(char *path, size_t len) {
-    int fd;
-    struct sockaddr_un sun;
-
-    fd = socket(AF_LOCAL, SOCK_STREAM, 0);
-    if (fd < 0) {
-        PLOGE("socket");
-        return -1;
-    }
-    if (fcntl(fd, F_SETFD, FD_CLOEXEC)) {
-        PLOGE("fcntl FD_CLOEXEC");
-        goto err;
-    }
-
-    memset(&sun, 0, sizeof(sun));
-    sun.sun_family = AF_LOCAL;
-    snprintf(path, len, "%s/.socket%d", REQUESTOR_CACHE_PATH, getpid());
-    memset(sun.sun_path, 0, sizeof(sun.sun_path));
-    snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", path);
-
-    /*
-     * Delete the socket to protect from situations when
-     * something bad occured previously and the kernel reused pid from that process.
-     * Small probability, isn't it.
-     */
-    unlink(sun.sun_path);
-
-    if (bind(fd, (struct sockaddr*)&sun, sizeof(sun)) < 0) {
-        PLOGE("bind");
-        goto err;
-    }
-
-    if (listen(fd, 1) < 0) {
-        PLOGE("listen");
-        goto err;
-    }
-
-    return fd;
-err:
-    close(fd);
-    return -1;
-}
-
-static int socket_accept(int serv_fd) {
-    struct timeval tv;
-    fd_set fds;
-    int fd, rc;
-
-    /* Wait 20 seconds for a connection, then give up. */
-    tv.tv_sec = 20;
-    tv.tv_usec = 0;
-    FD_ZERO(&fds);
-    FD_SET(serv_fd, &fds);
-    do {
-        rc = select(serv_fd + 1, &fds, NULL, NULL, &tv);
-    } while (rc < 0 && errno == EINTR);
-    if (rc < 1) {
-        PLOGE("select");
-        return -1;
-    }
-
-    fd = accept(serv_fd, NULL, NULL);
-    if (fd < 0) {
-        PLOGE("accept");
-        return -1;
-    }
-
-    return fd;
-}
-
-static int socket_send_request(int fd, const struct su_context *ctx) {
-#define write_data(fd, data, data_len)              \
-do {                                                \
-    size_t __len = htonl(data_len);                 \
-    __len = write((fd), &__len, sizeof(__len));     \
-    if (__len != sizeof(__len)) {                   \
-        PLOGE("write(" #data ")");                  \
-        return -1;                                  \
-    }                                               \
-    __len = write((fd), data, data_len);            \
-    if (__len != data_len) {                        \
-        PLOGE("write(" #data ")");                  \
-        return -1;                                  \
-    }                                               \
-} while (0)
-
-#define write_string_data(fd, name, data)        \
-do {                                        \
-    write_data(fd, name, strlen(name));     \
-    write_data(fd, data, strlen(data));     \
-} while (0)
-
-// stringify everything.
-#define write_token(fd, name, data)         \
-do {                                        \
-    char buf[16];                           \
-    snprintf(buf, sizeof(buf), "%d", data); \
-    write_string_data(fd, name, buf);            \
-} while (0)
-
-    write_token(fd, "version", PROTO_VERSION);
-    write_token(fd, "binary.version", VERSION_CODE);
-    write_token(fd, "pid", ctx->from.pid);
-    write_string_data(fd, "from.name", ctx->from.name);
-    write_string_data(fd, "to.name", ctx->to.name);
-    write_token(fd, "from.uid", ctx->from.uid);
-    write_token(fd, "to.uid", ctx->to.uid);
-    write_string_data(fd, "from.bin", ctx->from.bin);
-    // TODO: Fix issue where not using -c does not result a in a command
-    write_string_data(fd, "command", get_command(&ctx->to));
-    write_token(fd, "eof", PROTO_VERSION);
-    return 0;
-}
-
-static int socket_receive_result(int fd, char *result, ssize_t result_len) {
-    ssize_t len;
-
-    LOGD("waiting for user");
-    len = read(fd, result, result_len-1);
-    if (len < 0) {
-        PLOGE("read(result)");
-        return -1;
-    }
-    result[len] = '\0';
-
-    return 0;
-}
 
 static void usage(int status) {
     FILE *stream = (status == EXIT_SUCCESS) ? stdout : stderr;
@@ -587,9 +436,7 @@ int su_main(int argc, char *argv[], int need_client) {
             .android_user_id = 0,
         },
     };
-    struct stat st;
-    int c, socket_serv_fd, fd;
-    char buf[64], *result;
+    int c;
     struct option long_opts[] = {
         { "command",            required_argument,    NULL, 'c' },
         { "help",            no_argument,        NULL, 'h' },
@@ -668,7 +515,6 @@ int su_main(int argc, char *argv[], int need_client) {
     }
     ctx.to.optind = optind;
 
-    su_ctx = &ctx;
     if (from_init(&ctx.from) < 0) {
         fail(&ctx);
     }
@@ -684,76 +530,4 @@ int su_main(int argc, char *argv[], int need_client) {
         fail(&ctx);
     }
 
-    // odd perms on superuser data dir
-    if (st.st_gid != st.st_uid) {
-        LOGE("Bad uid/gid %d/%d for Superuser Requestor application",
-                (int)st.st_uid, (int)st.st_gid);
-        fail(&ctx);
-    }
-
-    mkdir(REQUESTOR_CACHE_PATH, 0770);
-    if (chown(REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid)) {
-        PLOGE("chown (%s, %u, %u)", REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid);
-        fail(&ctx);
-    }
-
-    if (setgroups(0, NULL)) {
-        PLOGE("setgroups");
-        fail(&ctx);
-    }
-    if (setegid(st.st_gid)) {
-        PLOGE("setegid (%u)", st.st_gid);
-        fail(&ctx);
-    }
-    if (seteuid(st.st_uid)) {
-        PLOGE("seteuid (%u)", st.st_uid);
-        fail(&ctx);
-    }
-
-    socket_serv_fd = socket_create_temp(ctx.sock_path, sizeof(ctx.sock_path));
-    LOGD("%s", ctx.sock_path);
-    if (socket_serv_fd < 0) {
-        fail(&ctx);
-    }
-
-    signal(SIGHUP, cleanup_signal);
-    signal(SIGPIPE, cleanup_signal);
-    signal(SIGTERM, cleanup_signal);
-    signal(SIGQUIT, cleanup_signal);
-    signal(SIGINT, cleanup_signal);
-    signal(SIGABRT, cleanup_signal);
-
-    atexit(cleanup);
-
-    fd = socket_accept(socket_serv_fd);
-    if (fd < 0) {
-        fail(&ctx);
-    }
-    if (socket_send_request(fd, &ctx)) {
-        fail(&ctx);
-    }
-    if (socket_receive_result(fd, buf, sizeof(buf))) {
-        fail(&ctx);
-    }
-
-    close(fd);
-    close(socket_serv_fd);
-    socket_cleanup(&ctx);
-
-    result = buf;
-
-#define SOCKET_RESPONSE    "socket:"
-    if (strncmp(result, SOCKET_RESPONSE, sizeof(SOCKET_RESPONSE) - 1))
-        LOGW("SECURITY RISK: Requestor still receives credentials in intent");
-    else
-        result += sizeof(SOCKET_RESPONSE) - 1;
-
-    if (!strcmp(result, "fail")) {
-        fail(&ctx);
-    } else if (!strcmp(result, "ALLOW")) {
-        allow(&ctx);
-    } else {
-        LOGE("unknown response from Superuser Requestor: %s", result);
-        fail(&ctx);
-    }
 }
