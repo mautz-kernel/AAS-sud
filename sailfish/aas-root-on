@@ -9,8 +9,8 @@ echo "=== AAS Root einschalten ==="
 /usr/sbin/appsupport-attach /system/bin/sh -c '
     set -eu
 
-    BIN=/data/local/tmp/sud-allowlist
-    EXTRA=/data/local/tmp/aas-su-allow-test/extra
+    BIN=/data/local/aas-sud/sud-allowlist
+    EXTRA=/data/local/aas-sud/extra
 
     # Dateien prüfen
     if [ ! -x "$BIN" ] || [ ! -x "$EXTRA/su" ]; then
@@ -48,7 +48,7 @@ else
         --unit=aas-sud-test \
         --collect \
         /usr/sbin/appsupport-attach \
-        /data/local/tmp/sud-allowlist --daemon
+        /data/local/aas-sud/sud-allowlist --daemon
 fi
 
 # Daemon kontrollieren

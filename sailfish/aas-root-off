@@ -28,5 +28,15 @@ fi
         exit 1
     fi
 
+    # Veraltetes Superuser-Daemon-Verzeichnis entfernen
+    rm -rf /dev/com.koushikdutta.superuser.daemon
+
+    # Bereinigung kontrollieren
+    if [ -e /dev/com.koushikdutta.superuser.daemon ] ||
+       [ -L /dev/com.koushikdutta.superuser.daemon ]; then
+        echo "FEHLER: Superuser-Daemon-Verzeichnis noch vorhanden!"
+        exit 1
+    fi
+
     echo "Root AUS"
 '
