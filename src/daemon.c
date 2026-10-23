@@ -82,7 +82,12 @@ static int recv_fd(int sockfd) {
         .msg_controllen = sizeof(cmsgbuf),
     };
 
-    if (recvmsg(sockfd, &msg, MSG_WAITALL) != 1) {
+    if (recvmsg(sockfd, &msg, MSG_WAITALL | MSG_CMSG_CLOEXEC) != 1) {
+        goto error;
+    }
+
+    if (msg.msg_flags & MSG_CTRUNC) {
+        LOGE("truncated SCM_RIGHTS control message");
         goto error;
     }
 
