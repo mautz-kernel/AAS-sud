@@ -272,6 +272,10 @@ static int daemon_accept(int fd, uid_t peer_uid, pid_t peer_pid) {
     }
     LOGD("remote args: %d", argc);
     char** argv = (char**)malloc(sizeof(char*) * (argc + 1));
+    if (argv == NULL) {
+        LOGE("unable to allocate argv");
+        exit(-1);
+    }
     argv[argc] = NULL;
     int i;
     for (i = 0; i < argc; i++) {
@@ -302,9 +306,14 @@ static int daemon_accept(int fd, uid_t peer_uid, pid_t peer_pid) {
 
         LOGD("waiting for child exit");
         if (waitpid(child, &status, 0) > 0) {
-            code = WEXITSTATUS(status);
-        }
-        else {
+            if (WIFEXITED(status)) {
+                code = WEXITSTATUS(status);
+            } else if (WIFSIGNALED(status)) {
+                code = 128 + WTERMSIG(status);
+            } else {
+                code = -1;
+            }
+        } else {
             code = -1;
         }
 
