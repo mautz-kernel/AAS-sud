@@ -162,26 +162,86 @@ static void send_fd(int sockfd, int fd) {
         }
     }
 
-    if (sendmsg(sockfd, &msg, 0) != 1) {
+    if (sendmsg(sockfd, &msg, MSG_NOSIGNAL) != 1) {
 error:
         PLOGE("unable to send fd");
         exit(-1);
     }
 }
 
+// Unix SOCK_STREAM does not guarantee that one read/write transfers
+// the entire requested buffer. Handle short operations and EINTR.
+static ssize_t read_full(int fd, void *buf, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = read(fd, (char *)buf + done, len - done);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0)
+            return 0; // EOF, including a truncated message
+        done += (size_t)n;
+    }
+    return (ssize_t)done;
+}
+
+static ssize_t write_full(int fd, const void *buf, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = send(fd, (const char *)buf + done, len - done,
+                         MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0) {
+            errno = EIO; // Prevent an infinite loop
+            return -1;
+        }
+        done += (size_t)n;
+    }
+    return (ssize_t)done;
+}
+
+// Per-call protection for both sides of the client/daemon socket.
+// A separate alarm below limits the entire request-protocol phase.
+#define SOCKET_IO_TIMEOUT_SEC 15
+#define REQUEST_PROTOCOL_TIMEOUT_SEC 15
+
+static int set_socket_io_timeouts(int fd) {
+    const struct timeval timeout = {
+        .tv_sec = SOCKET_IO_TIMEOUT_SEC,
+        .tv_usec = 0,
+    };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout)) != 0) {
+        PLOGE("SO_RCVTIMEO");
+        return -1;
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                   &timeout, sizeof(timeout)) != 0) {
+        PLOGE("SO_SNDTIMEO");
+        return -1;
+    }
+    return 0;
+}
+
 static int read_int(int fd) {
     int val;
-    int len = read(fd, &val, sizeof(int));
-    if (len != sizeof(int)) {
-        LOGE("unable to read int: %d", len);
+    ssize_t len = read_full(fd, &val, sizeof(val));
+    if (len != (ssize_t)sizeof(val)) {
+        LOGE("unable to read int: %zd", len);
         exit(-1);
     }
     return val;
 }
 
 static void write_int(int fd, int val) {
-    int written = write(fd, &val, sizeof(int));
-    if (written != sizeof(int)) {
+    ssize_t written = write_full(fd, &val, sizeof(val));
+    if (written != (ssize_t)sizeof(val)) {
         PLOGE("unable to write int");
         exit(-1);
     }
@@ -199,7 +259,7 @@ static char* read_string(int fd) {
         exit(-1);
     }
     val[len] = '\0';
-    int amount = read(fd, val, len);
+    ssize_t amount = read_full(fd, val, (size_t)len);
     if (amount != len) {
         LOGE("unable to read string");
         exit(-1);
@@ -210,7 +270,7 @@ static char* read_string(int fd) {
 static void write_string(int fd, char* val) {
     int len = strlen(val);
     write_int(fd, len);
-    int written = write(fd, val, len);
+    ssize_t written = write_full(fd, val, (size_t)len);
     if (written != len) {
         PLOGE("unable to write string");
         exit(-1);
@@ -247,6 +307,11 @@ static int daemon_accept(int fd, uid_t peer_uid, pid_t peer_pid) {
     // Never use the client-supplied UID or PID for authorization.
     daemon_from_uid = peer_uid;
     daemon_from_pid = peer_pid;
+
+    // A hard wall-clock limit, not reset by trickled client data.
+    // This process handles only the request protocol until the alarm is
+    // cancelled below; long-running root commands must remain unaffected.
+    alarm(REQUEST_PROTOCOL_TIMEOUT_SEC);
 
     // Authorize before reading even the first client-controlled field.
     write_int(fd, 1);
@@ -285,6 +350,9 @@ static int daemon_accept(int fd, uid_t peer_uid, pid_t peer_pid) {
     // ack
     write_int(fd, 1);
 
+    // Protocol complete. Do not kill legitimate long-running commands.
+    alarm(0);
+
     // Fork the child process. The fork has to happen before calling
     // setsid() and opening the pseudo-terminal so that the parent
     // is not affected
@@ -292,7 +360,8 @@ static int daemon_accept(int fd, uid_t peer_uid, pid_t peer_pid) {
     if (child < 0) {
         // fork failed, send a return code and bail out
         PLOGE("unable to fork");
-        write(fd, &child, sizeof(int));
+        if (write_full(fd, &child, sizeof(child)) != sizeof(child))
+            PLOGE("unable to send fork failure");
         close(fd);
         return child;
     }
@@ -319,7 +388,7 @@ static int daemon_accept(int fd, uid_t peer_uid, pid_t peer_pid) {
 
         // Pass the return code back to the client
         LOGD("sending code");
-        if (write(fd, &code, sizeof(int)) != sizeof(int)) {
+        if (write_full(fd, &code, sizeof(code)) != sizeof(code)) {
             PLOGE("unable to write exit code");
         }
 
@@ -411,6 +480,12 @@ int run_daemon() {
                 continue;
             PLOGE("accept");
             break;
+        }
+
+        // Deny slow or non-reading peers before allocating a worker.
+        if (set_socket_io_timeouts(client) != 0) {
+            close(client);
+            continue;
         }
 
         // Check kernel credentials BEFORE forking or reading client data.
@@ -528,6 +603,11 @@ int connect_daemon(int argc, char *argv[], int ppid) {
         exit(-1);
     }
 
+    if (set_socket_io_timeouts(socketfd) != 0) {
+        close(socketfd);
+        return EXIT_FAILURE;
+    }
+
     // Wait for the listener's authorization before sending any client data.
     int authorized = read_int(socketfd);
     if (!authorized) {
@@ -608,6 +688,16 @@ int connect_daemon(int argc, char *argv[], int ppid) {
 
     // Wait for acknowledgement from daemon
     read_int(socketfd);
+
+    // The request protocol is complete. Waiting for the exit status can
+    // legitimately take hours; do not time out long-running root commands.
+    const struct timeval no_recv_timeout = { .tv_sec = 0, .tv_usec = 0 };
+    if (setsockopt(socketfd, SOL_SOCKET, SO_RCVTIMEO,
+                   &no_recv_timeout, sizeof(no_recv_timeout)) != 0) {
+        PLOGE("clear SO_RCVTIMEO");
+        close(socketfd);
+        return EXIT_FAILURE;
+    }
 
     if (atty & ATTY_IN) {
         setup_sighandlers();
