@@ -50,6 +50,29 @@ int is_daemon = 0;
 int daemon_from_uid = 0;
 int daemon_from_pid = 0;
 
+// Count only the listener's direct children (one worker per authorized request).
+// A worker stays alive until its root command has exited.
+#define MAX_ACTIVE_WORKERS 16
+static volatile sig_atomic_t active_workers = 0;
+
+// Called only in the listener. The worker restores SIGCHLD to SIG_DFL.
+static void reap_workers(int signo) {
+    (void)signo;
+    int saved_errno = errno;
+    for (;;) {
+        pid_t pid = waitpid(-1, NULL, WNOHANG);
+        if (pid > 0) {
+            if (active_workers > 0)
+                --active_workers;
+            continue;
+        }
+        if (pid < 0 && errno == EINTR)
+            continue;
+        break;
+    }
+    errno = saved_errno;
+}
+
 // Constants for the atty bitfield
 #define ATTY_IN     1
 #define ATTY_OUT    2
@@ -473,6 +496,25 @@ int run_daemon() {
         goto err;
     }
 
+    // Only the listener reaps workers. Workers must wait for their own
+    // command child using waitpid() in daemon_accept().
+    struct sigaction chld_action = {0};
+    chld_action.sa_handler = reap_workers;
+    chld_action.sa_flags = SA_NOCLDSTOP; // accept already handles EINTR
+    sigemptyset(&chld_action.sa_mask);
+    if (sigaction(SIGCHLD, &chld_action, NULL) < 0) {
+        PLOGE("sigaction SIGCHLD");
+        goto err;
+    }
+
+    sigset_t chld_mask;
+    sigemptyset(&chld_mask);
+    sigaddset(&chld_mask, SIGCHLD);
+    if (sigprocmask(SIG_UNBLOCK, &chld_mask, NULL) < 0) {
+        PLOGE("unblock SIGCHLD");
+        goto err;
+    }
+
     for (;;) {
         int client = accept(fd, NULL, NULL);
         if (client < 0) {
@@ -509,10 +551,50 @@ int run_daemon() {
             continue;
         }
 
-        if (fork_zero_fucks() == 0) {
+        // Block SIGCHLD until the new worker is recorded: no counter race.
+        sigset_t old_mask;
+        if (sigprocmask(SIG_BLOCK, &chld_mask, &old_mask) < 0) {
+            PLOGE("block SIGCHLD");
+            close(client);
+            break;
+        }
+
+        if (active_workers >= MAX_ACTIVE_WORKERS) {
+            const int busy = -1;
+            LOGW("sud: worker limit reached (%d)", MAX_ACTIVE_WORKERS);
+            (void)send(client, &busy, sizeof(busy), MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0) {
+                PLOGE("restore signal mask");
+                close(client);
+                break;
+            }
+            close(client);
+            continue;
+        }
+
+        pid_t worker = fork();
+        if (worker == 0) {
+            // Never inherit the listener's reaper: it could consume the
+            // exit status that daemon_accept() needs from waitpid().
+            struct sigaction default_chld = {0};
+            default_chld.sa_handler = SIG_DFL;
+            sigemptyset(&default_chld.sa_mask);
+            if (sigaction(SIGCHLD, &default_chld, NULL) < 0 ||
+                sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0) {
+                _exit(EXIT_FAILURE);
+            }
             close(fd);
             return daemon_accept(client, credentials.uid, credentials.pid);
         }
+        if (worker > 0)
+            ++active_workers;
+        if (sigprocmask(SIG_SETMASK, &old_mask, NULL) < 0) {
+            PLOGE("restore signal mask");
+            close(client);
+            break;
+        }
+        if (worker < 0)
+            PLOGE("fork worker");
         close(client);
     }
 
@@ -610,8 +692,9 @@ int connect_daemon(int argc, char *argv[], int ppid) {
 
     // Wait for the listener's authorization before sending any client data.
     int authorized = read_int(socketfd);
-    if (!authorized) {
-        fprintf(stderr, "%s\n", strerror(EACCES));
+    if (authorized != 1) {
+        // -1 means capacity exhausted; all other values mean denied.
+        fprintf(stderr, "%s\n", strerror(authorized == -1 ? EAGAIN : EACCES));
         close(socketfd);
         return EXIT_FAILURE;
     }
